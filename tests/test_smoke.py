@@ -466,7 +466,7 @@ class TestFrozenHostCompat:
 
             root = r"{ROOT}"
             spec = importlib.util.spec_from_file_location(
-                "_nsc_frozen", root + "\\\\__init__.py", submodule_search_locations=[root]
+                "_nsc_frozen", root + "/__init__.py", submodule_search_locations=[root]
             )
             module = importlib.util.module_from_spec(spec)
             sys.modules["_nsc_frozen"] = module
