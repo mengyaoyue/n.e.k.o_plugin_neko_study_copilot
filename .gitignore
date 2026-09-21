@@ -1,0 +1,27 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# ── 打包产物 ──
+build/
+dist/
+*.neko-plugin
+
+# ── 运行时数据（禁止提交：含账号凭据与学习记录）──
+config/
+data/
+store.db
+*.sqlite3
+
+# ── 编辑器（.vscode 必须保留：官方 check 要求入库）──
+.idea/
+.DS_Store
