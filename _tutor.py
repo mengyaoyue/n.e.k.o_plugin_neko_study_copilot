@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from . import _fmt as fmt
+from ._persona import directive as persona_directive
 from ._profiles import form_label
 from ._syllabus import KnowledgePoint, validate_form
 
@@ -96,8 +98,8 @@ def stage_guidance(point: KnowledgePoint, stage: str) -> str:
     )
 
 
-def build_teach_prompt(context: TeachContext, resources: str = "") -> tuple[str, str]:
-    """返回 (system, user) 两段提示词。"""
+def build_teach_prompt(context: TeachContext, resources: str = "", persona: str = "full") -> tuple[str, str]:
+    """返回 (system, user) 两段提示词。``persona`` 控制人设强度（见 ``_persona``）。"""
     point = context.point
     style_hint = {
         "gentle": "语气温和鼓励，多用『我们可以这样想』，出错时先肯定思路再纠正；",
@@ -106,6 +108,7 @@ def build_teach_prompt(context: TeachContext, resources: str = "") -> tuple[str,
     }.get(context.style, "")
     system = (
         f"你是{context.exam_name}的辅导老师。{style_hint}\n"
+        f"{persona_directive(persona)}\n"
         "教学必须遵守以下结构，不要跳步：\n"
         "1. 这个知识点到底是什么（定义 + 它解决什么问题）\n"
         "2. 使用条件与常见误区（什么时候能用、什么时候不能用）\n"
@@ -139,9 +142,11 @@ def build_quiz_prompt(
     region: str,
     with_traps: bool = True,
     resources: str = "",
+    persona: str = "full",
 ) -> tuple[str, str]:
     system = (
         f"你是{exam_name}的命题老师。你要出的题必须**完全符合真实考试的命题规律**。\n"
+        f"{persona_directive(persona)}\n"
         "绝对禁止：\n"
         "  · 出该知识点在真题里不会出现的题型（例如把只考选择的考点出成解答题）；\n"
         "  · 超纲、引入本阶段不该出现的知识点；\n"
@@ -167,9 +172,16 @@ def build_quiz_prompt(
     return system, user
 
 
-def build_grade_prompt(point: KnowledgePoint, question: str, answer: str, exam_name: str) -> tuple[str, str]:
+def build_grade_prompt(
+    point: KnowledgePoint,
+    question: str,
+    answer: str,
+    exam_name: str,
+    persona: str = "full",
+) -> tuple[str, str]:
     system = (
         f"你是{exam_name}的阅卷老师。按真实考试的给分标准批改，做到：\n"
+        f"{persona_directive(persona)}\n"
         "1. 判定对错，给出得分率（0-1 之间）；\n"
         "2. 指出具体错在第几步，而不是只说『错了』；\n"
         "3. 区分『不会』和『会但做错』——后者只扣过程分，并指出触发错误的条件；\n"
@@ -219,34 +231,35 @@ def _subject_cn(subject: str) -> str:
 
 
 def format_questions(questions: list[dict[str, Any]]) -> str:
-    """把 JSON 题目渲染成给学习者的文本（答案默认折叠在解析里）。"""
+    """把 JSON 题目渲染成给学习者的文本（题干 + 选项 + 答案 + 解析）。"""
     if not questions:
-        return "没有生成题目喵。"
-    lines = []
+        return "这次没能生成题目，换个知识点或稍后重试。"
+    lines: list[str] = []
     for index, item in enumerate(questions, start=1):
         question = str(item.get("question") or "").strip()
         form = str(item.get("form") or "")
-        lines.append(f"\n{index}. 【{form_label(form) if form else '练习'}】{question}")
-        options = item.get("options") or []
-        if options:
-            lines.extend(f"    {option}" for option in options)
+        tag = form_label(form) if form else "练习"
+        lines.append(f"**{index}. [{tag}]** {question}")
+        for option in item.get("options") or []:
+            lines.append(f"　　{option}")
         answer = str(item.get("answer") or "").strip()
         if answer:
-            lines.append(f"    参考答案：{answer}")
+            lines.append(f"　　{fmt.bold('参考答案')}：{answer}")
         solution = str(item.get("solution") or "").strip()
         if solution:
-            lines.append(f"    解析：{solution}")
+            lines.append(f"　　{fmt.bold('解析')}：{solution}")
         trap = str(item.get("trap") or "").strip()
         if trap:
-            lines.append(f"    ⚠ 易错点：{trap}")
-    return "\n".join(lines)
+            lines.append(f"　　{fmt.bold('易错点')}：{trap}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def quiz_intro(point: KnowledgePoint, stage: str, count: int) -> str:
     forms = "、".join(form_label(item) for item in point.forms)
-    return (
-        f"围绕【{point.name}】出 {count} 道题，当前阶段是{STAGE_LABELS.get(stage, stage)}。\n"
-        f"说明：{point.name} 在真题里只以 {forms} 出现，所以下面的题也都是这个形态喵。"
+    return fmt.join(
+        f"围绕 **{point.name}** 出 {count} 道题，当前阶段：{STAGE_LABELS.get(stage, stage)}。",
+        fmt.note(f"{point.name} 在真题里只以 {forms} 出现，所以下面的题也都是这个形态。"),
     )
 
 

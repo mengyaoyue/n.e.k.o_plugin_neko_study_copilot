@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import _fmt as fmt
 from ._planner import subject_label
 from ._profiles import (
     ExamProfile,
@@ -370,40 +371,63 @@ def _build_basis(
 
 
 def format_forecast(forecast: Forecast) -> str:
-    lines = [
-        f"【{forecast.exam_name}】满分 {forecast.total_score:g}",
-        f"现在就考：约 {forecast.current:.0f} 分",
-        f"最坏预期：约 {forecast.conservative:.0f} 分（发挥失常 + 题目变形）",
-        f"最可能：约 {forecast.likely:.0f} 分",
-        f"较好预期：约 {forecast.ideal:.0f} 分（按计划执行到位）",
-        f"波动区间：±{forecast.volatility:.0f} 分，剩余 {forecast.days_left} 天",
+    """三档分数预期。面板会把这些记号渲染成卡片 + 进度条。"""
+    head = fmt.kv("考试", forecast.exam_name) + "\n"
+    head += fmt.kv("满分", f"{forecast.total_score:g} 分") + "\n"
+    head += fmt.kv("剩余", f"{forecast.days_left} 天")
+
+    scores = [
+        fmt.kv("现在就考", f"约 {forecast.current:.0f} 分"),
+        fmt.kv("最坏预期", f"约 {forecast.conservative:.0f} 分（发挥失常 + 题目变形）"),
+        fmt.kv("最可能", f"**约 {forecast.likely:.0f} 分**"),
+        fmt.kv("较好预期", f"约 {forecast.ideal:.0f} 分（按计划执行到位）"),
+        fmt.kv("波动区间", f"±{forecast.volatility:.0f} 分"),
     ]
     if forecast.pass_line:
         probability = forecast.pass_probability
         percent = f"{probability:.0%}" if probability is not None else "未知"
-        lines.append(f"通过线 {forecast.pass_line:g} 分：按最可能成绩估算的通过概率约 {percent}")
-    lines.append("\n分科目：")
+        scores.append(fmt.kv("通过线", f"{forecast.pass_line:g} 分，通过概率约 {percent}"))
+
+    blocks = [fmt.section("总览", head), fmt.section("分数预期", fmt.bullets(scores))]
+    # 没有任何作答记录时，上面的分数全是按默认 50% 推的——必须说清楚，别让它看起来像结论
+    tracked_total = sum(int(row.get("tracked_points") or 0) for row in forecast.per_subject)
+    if tracked_total == 0:
+        blocks.insert(
+            0,
+            fmt.note(
+                "⚠ 目前**没有任何作答记录**，下面的分数全部按默认掌握度 50% 估算，只能看量级、"
+                "不能当结论。做几道题（或发一张卷子给我）之后重算，区间会立刻收窄。"
+            ),
+        )
+
+    rows = []
     for row in forecast.per_subject:
         row_credit = f"，{row['credit']:g} 学分" if row.get("credit") else ""
         row_gpa = f"，绩点 {row['gpa']:.2f}" if row.get("gpa") is not None else ""
-        lines.append(
-            f"  · {row['name']}：掌握度 {row['mastery']:.0%} → 得分率 {row['rate']:.0%} → "
-            f"约 {row['expected']:.0f}/{row['full_score']:g} 分"
-            f"{row_credit}{row_gpa}（置信度：{row['confidence']}）"
+        rows.append(
+            f"{row['name']}　{fmt.bar(row['rate'])} {fmt.pct(row['rate'])}"
+            f"　约 {row['expected']:.0f}/{row['full_score']:g} 分{row_credit}{row_gpa}"
+            f"　（{row['confidence']}）"
         )
+    if rows:
+        blocks.append(fmt.section("分科目", "\n".join(f"- {row}" for row in rows)))
+
     if forecast.gpa is not None:
-        lines.append(f"\n学分加权绩点：约 {forecast.gpa:.2f} / {forecast.gpa_scale:g}")
+        gpa_lines = [fmt.kv("学分加权绩点", f"{forecast.gpa:.2f} / {forecast.gpa_scale:g}")]
         if forecast.gpa_note:
-            lines.append(f"  {forecast.gpa_note}")
+            gpa_lines.append(fmt.note(forecast.gpa_note))
+        blocks.append(fmt.section("绩点", "\n".join(gpa_lines)))
+
     if forecast.fail_risks:
-        lines.append("\n挂科 / 及格风险（先保这些）：")
-        for row in forecast.fail_risks[:4]:
-            lines.append(
-                f"  · {row['name']}：预计 {row['expected']:.0f} 分，得分率 {row['rate']:.0%} → {row['risk']}"
-            )
-    lines.append("\n依据：")
-    lines.extend(f"  · {item}" for item in forecast.basis)
-    return "\n".join(lines)
+        risk_rows = [
+            f"{row['name']}：预计 {row['expected']:.0f} 分，得分率 {fmt.pct(row['rate'])} → {row['risk']}"
+            for row in forecast.fail_risks[:4]
+        ]
+        blocks.append(fmt.section("挂科 / 及格风险（先保这些）", fmt.bullets(risk_rows)))
+
+    if forecast.basis:
+        blocks.append(fmt.section("依据", fmt.bullets(forecast.basis)))
+    return fmt.join(*blocks)
 
 
 # ── 题目 / 试卷文本扫描 ────────────────────────────────────────
@@ -420,6 +444,8 @@ class DiagnosisResult:
     weak: list[dict[str, Any]]
     scores: list[dict[str, Any]]
     summary: str
+    # 有掌握度记录的知识点数：0 表示"薄弱项"是按权重排的，不是按他的真实水平
+    tracked_points: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -428,6 +454,7 @@ class DiagnosisResult:
             "weak": self.weak,
             "scores": self.scores,
             "summary": self.summary,
+            "tracked_points": self.tracked_points,
         }
 
 
@@ -506,28 +533,38 @@ def diagnose(
             f"从你给的材料里识别到 {len(matched)} 个可能的知识点："
             + "、".join(point.name for point in matched[:5])
         )
-    else:
+    elif mastery:
         summary = "没能从材料里直接识别知识点，以下是按历史掌握度排出的薄弱项。"
+    else:
+        summary = "没能从材料里直接识别知识点。"
+    if not text:
+        summary += "（你还没给材料，这次只用了本地记录。）"
+    if not mastery:
+        summary += "**目前没有任何作答记录**：下面的薄弱项是按考点权重与考频排的，不代表你的真实水平。"
     if scores:
         summary += "；同时识别到成绩信息：" + "、".join(
             f"{row['name']} {row['score']:g}" + (f"/{row['full']:g}" if row["full"] else "") for row in scores[:6]
         )
-    return DiagnosisResult(subject=subject, matched=matched, weak=weak, scores=scores, summary=summary)
+    return DiagnosisResult(
+        subject=subject, matched=matched, weak=weak, scores=scores, summary=summary, tracked_points=len(mastery)
+    )
 
 
 def format_diagnosis(result: DiagnosisResult) -> str:
-    lines = [result.summary]
+    blocks: list[str] = []
+    if result.summary:
+        blocks.append(result.summary)
     if result.matched:
-        lines.append("\n可能涉及：")
+        rows = []
         for point in result.matched[:6]:
             forms = "、".join(point.forms)
-            lines.append(f"  · {point.name}（只出现在：{forms}）难度 {point.difficulty:g}/5")
+            line = f"**{point.name}**　难度 {point.difficulty:g}/5　命题形式：{forms}"
             if point.traps:
-                lines.append(f"    易错点：{point.traps[0]}")
+                line += f"\n  ↳ 易错点：{point.traps[0]}"
+            rows.append(line)
+        blocks.append(fmt.section("可能涉及", fmt.bullets(rows)))
     if result.weak:
-        lines.append("\n优先补的薄弱点（按提分性价比）：")
-        for row in result.weak[:6]:
-            lines.append(
-                f"  · {row['name']}：{row['reason']}｜性价比 {row['roi']}"
-            )
-    return "\n".join(lines)
+        rows = [f"**{row['name']}**：{row['reason']}　性价比 {row['roi']}" for row in result.weak[:6]]
+        title = "优先补的薄弱点" if result.tracked_points else "优先补的方向（**暂无作答记录，按权重排序**）"
+        blocks.append(fmt.section(title, fmt.bullets(rows)))
+    return fmt.join(*blocks)

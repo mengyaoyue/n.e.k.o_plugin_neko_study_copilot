@@ -16,10 +16,39 @@ import asyncio
 import json
 import socket
 import threading
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 _MAX_HEAD = 64 * 1024
 _MAX_BODY = 16 * 1024 * 1024
+
+_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+
+def guess_mime(name: str) -> str:
+    """按扩展名给静态资源定 MIME。宿主托管时用不到，插件端口托管时靠它。"""
+    return _MIME.get(Path(name).suffix.lower(), "application/octet-stream")
 
 
 class PanelServer:
@@ -30,10 +59,14 @@ class PanelServer:
         port: int,
         html_provider: Callable[[], str],
         endpoints: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]],
+        static_resolver: Optional[Callable[[str], Optional[tuple[bytes, str]]]] = None,
     ):
         self.port = int(port)
         self._html_provider = html_provider
         self._endpoints = endpoints
+        # 静态资源解析器：(相对路径) -> (bytes, mime)；页面被插件自己的端口托管时
+        # 背景图 / 字体都靠它，否则会 404（宿主托管时才由宿主负责）
+        self._static = static_resolver
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -148,6 +181,13 @@ class PanelServer:
             return 200, html.encode("utf-8"), "text/html; charset=utf-8"
         fn = self._endpoints.get((method, route))
         if fn is None:
+            if method == "GET" and self._static is not None:
+                try:
+                    hit = self._static(route.lstrip("/"))
+                except Exception:
+                    hit = None
+                if hit is not None:
+                    return 200, hit[0], hit[1]
             return 404, self._json({"error": f"未知接口 {method} {route}"}), "application/json; charset=utf-8"
         payload: dict[str, Any] = {}
         if body:
@@ -170,6 +210,14 @@ class PanelServer:
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     @staticmethod
+    def _cache_header(ctype: str) -> str:
+        """图片与字体可以放心缓存：否则每开一次面板都要重下几 MB 的背景图。"""
+        head = (ctype or "").split(";")[0].strip().lower()
+        if head.startswith(("image/", "font/")) or head in ("application/font-woff",):
+            return "public, max-age=86400"
+        return "no-store"
+
+    @staticmethod
     def _write(conn: socket.socket, status: int, body: bytes, ctype: str) -> None:
         reason = {
             200: "OK",
@@ -185,7 +233,7 @@ class PanelServer:
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Cache-Control: no-store\r\n"
+            f"Cache-Control: {PanelServer._cache_header(ctype)}\r\n"
             "Connection: close\r\n"
             "\r\n"
         )

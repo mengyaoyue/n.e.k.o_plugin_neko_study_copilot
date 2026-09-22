@@ -224,7 +224,39 @@ def main():
     assert_true("猫娘" in system, "提示词应注入猫娘角色")
     assert_true("具体动作" in system, "提示词应要求给具体动作")
     assert_true("12355" in user or not comfort.risk, "风险时应把热线带进用户提示")
-    assert_true(comfort.mood_label in user, "用户提示应带情绪状态")
+    # 关键回归：素材只作参考、原话必须被引用、事实纪律必须下发
+    assert_true("事实纪律" in system, "疏导提示词必须带事实纪律")
+    assert_true("不是给你的台词" in user, "模板素材必须明确标注为可选，而不是台词")
+    assert_true("不是说他就是这样" in user, "通用压力模式必须标注为通用规律")
+    assert_true("一直卡在瓶颈，分数不涨" in user, "必须把他的原话交给模型")
+
+    # 事故回归：用户只骂一句时，不许把估算值和通用描述写成他的经历
+    vague = psych.counsel("cet6", 85, 0.5, text="我草泥马")
+    assert_eq(vague.mood, "angry", "骂人应识别为烦躁，而不是套焦虑模板")
+    assert_eq(vague.insufficient, False, "有明确情绪时不走『信息不足』分支")
+    assert_true(
+        not any("掌握度" in text and "%" in text for _src, text in vague.facts),
+        "没有作答记录时，facts 里不许出现具体掌握度",
+    )
+    assert_true(
+        any("没有作答记录" in item or "默认值" in item for item in vague.unknowns),
+        "没有作答记录时必须明说不知道，而不是拿默认值当事实",
+    )
+    joined_facts = " ".join(text for _src, text in vague.facts)
+    for fabricated in ("考了三次", "都没过", "某某", "身边"):
+        assert_true(fabricated not in joined_facts, f"facts 里不许出现编造的经历：{fabricated}")
+    assert_true("很多人考了两三次" in vague.pattern, "通用规律只能待在 pattern 里")
+
+    short = psych.counsel("gaokao", 100, 0.5, text="唉")
+    assert_eq(short.insufficient, True, "信息不足应走提问分支，而不是长篇开讲")
+    _sys2, user2 = psych.build_comfort_prompt(short, "猫娘", "normal")
+    assert_true("不要给三条动作" in user2, "信息不足时应明确禁止套模板")
+
+    # 没有作答记录 → 不能把默认 0.5 当事实
+    unknown = psych.counsel("cet6", 60, 0.5, text="最近有点焦虑", mastery_known=False)
+    assert_true("暂无作答记录" in unknown.reading, "无记录时应写暂无记录")
+    _s3, user3 = psych.build_comfort_prompt(unknown, "猫娘", "normal")
+    assert_true("50%" not in user3 and "掌握度约 50" not in user3, "默认掌握度不得进提示词")
 
     # ── 7. 出题与批改提示词 ────────────────────────────────────
     print("7. 出题与批改")
@@ -253,7 +285,12 @@ def main():
     rendered = tutor.format_questions(questions)
     assert_true("选择题" in rendered and "B" in rendered, "题目渲染应完整")
     assert_true("易错点" in rendered, "渲染应带易错点")
-    assert_true("没有生成题目" in tutor.format_questions([]), "空题目应有兜底文案")
+    assert_true("没能生成题目" in tutor.format_questions([]), "空题目应有兜底文案")
+    # 排版记号：面板前端靠它们渲染成小节/列表，改了要同步改前端
+    any_point = next(iter(syllabus.POINTS.values()))
+    intro = tutor.quiz_intro(any_point, "medium", 3)
+    assert_true("**" in intro and "> " in intro, "出题引导应带强调与提示条记号")
+    assert_true("#" not in intro, "出题引导不该混入空标题记号")
 
     assert_eq(tutor.decide_stage(0.2), tutor.STAGE_BASIC, "低掌握度应出基础题")
     assert_eq(tutor.decide_stage(0.6), tutor.STAGE_MEDIUM, "中等掌握度应出中期题")
@@ -328,7 +365,11 @@ def main():
         "检索词应按 考试+科目+知识点 拼装",
     )
     assert_eq(sources.build_query("导数", "", ""), "导数", "空上下文应只留关键词")
-    assert_true("没有检索到" in sources.format_resources([]), "空结果应有兜底文案")
+    assert_true("没检索到" in sources.format_resources([]), "空结果应有兜底文案")
+    # 平台直链：不抓取也要能用，关键词必须被拼进 URL
+    links = sources.build_links("导数 单调性")
+    assert_true(len(links) >= 5 and all("http" in url for _n, url, _note in links), "应生成平台直链")
+    assert_true(any("%E5%AF%BC%E6%95%B0" in url for _n, url, _note in links), "直链应带上编码后的关键词")
 
     # ── 11. 大学生与证书类考试 ─────────────────────────────────
     print("11. 大学生与证书类")

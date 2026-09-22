@@ -14,6 +14,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import _fmt as fmt
+from . import _guard as guard
+from ._persona import directive as persona_directive
+
 # ── 风险信号：命中就必须停止"打鸡血"，转为明确的求助建议 ──────────
 RISK_KEYWORDS = (
     "不想活", "活不下去", "自杀", "自残", "轻生", "结束生命", "死了算了",
@@ -177,6 +181,24 @@ MOOD_STRATEGIES: dict[str, dict[str, Any]] = {
             "把这次分数当成一次免费的全真诊断——它能告诉你哪里该改，比任何模拟都准",
         ],
     },
+    # 骂人、拍桌子、说「服了」——这类话最容易被当成「焦虑」处理，
+    # 然后回一段呼吸法，结果火上浇油。这里单列一档。
+    "angry": {
+        "label": "烦躁 / 火大",
+        "reframe": "学不下去的时候骂两句太正常了，火气本身不是问题，"
+                   "问题是它会占掉你接下来一小时的工作记忆——先处理它，比先学习划算。",
+        "actions": [
+            "离开书桌三分钟，走一圈或洗把脸；不要坐着硬压火气，压不住",
+            "把最烦的那件事写成一句话（就一句），写出来它就从「一团堵」变成一个具体的麻烦",
+            "回来只做一件最小的：一道会做的题，或者把明天的书摆在桌上",
+        ],
+    },
+    # 一句话说不清的时候，正确的动作是问，不是讲。
+    "unclear": {
+        "label": "信息不足（需要先问清楚）",
+        "reframe": "",
+        "actions": [],
+    },
 }
 
 HINTS: dict[str, str] = {
@@ -217,6 +239,12 @@ class CounselResult:
     hint: str = ""
     risk: bool = False
     risk_text: str = ""
+    # ── 事实分层：只有 facts 能当事实讲，pattern 只是通用规律，unknowns 禁止推测 ──
+    user_text: str = ""
+    facts: list[tuple[str, str]] = field(default_factory=list)
+    unknowns: list[str] = field(default_factory=list)
+    pattern: str = ""
+    insufficient: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -232,6 +260,11 @@ class CounselResult:
             "hint": self.hint,
             "risk": self.risk,
             "risk_text": self.risk_text,
+            "user_text": self.user_text,
+            "facts": self.facts,
+            "unknowns": self.unknowns,
+            "pattern": self.pattern,
+            "insufficient": self.insufficient,
         }
 
 
@@ -243,12 +276,26 @@ MOOD_KEYWORDS: dict[str, tuple[str, ...]] = {
     "procrastinate": ("拖延", "不想学", "学不进去", "摆烂", "躺平", "启动不了", "刷手机"),
     "lost": ("迷茫", "没动力", "为什么学", "没意义", "不知道"),
     "down": ("考砸", "退步", "难过", "失落", "没考好", "崩了", "自责"),
+    # 泄愤类：不处理这一档的话，一句「我服了」会被当成焦虑，然后回一段呼吸法
+    "angry": (
+        "草泥马", "妈的", "卧槽", "我靠", "我去", "淦", "栓Q",
+        "傻逼", "sb", "SB", "md", "MD",
+        "烦死", "烦", "气死", "生气", "火大", "服了", "受不了", "无语", "吐了",
+        "垃圾", "什么鬼", "讨厌",
+    ),
 }
 
 
 def detect_mood(text: str) -> str:
+    """识别情绪。**认不出来就返回空串**，由调用方决定「问一句」而不是硬套模板。
+
+    早期版本认不出来时会兜底成「焦虑」，结果一句骂人的话被当成焦虑处理，
+    给了一段呼吸法——火上浇油。兜底应该是「问」，不是「猜」。
+    """
     text = text or ""
-    best = "anxious"
+    if not text.strip():
+        return ""
+    best = ""
     best_hits = 0
     for mood, keywords in MOOD_KEYWORDS.items():
         hits = sum(1 for keyword in keywords if keyword in text)
@@ -293,18 +340,56 @@ def counsel(
     mood: str = "",
     text: str = "",
     level: str = "normal",
+    *,
+    mastery_known: bool = False,
+    attempts: int = 0,
+    days_estimated: bool = False,
+    exam_date: str = "",
 ) -> CounselResult:
-    pressure = EXAM_PRESSURE.get(exam_type, EXAM_PRESSURE["gaokao"])
-    detected = mood or (detect_mood(text) if text else "")
-    if not detected or detected not in MOOD_STRATEGIES:
-        detected = _default_mood(days_left, mastery)
-    strategy = MOOD_STRATEGIES[detected]
-    risk = detect_risk(text)
+    """准备疏导材料。
 
-    reading = (
-        f"你现在的处境：{pressure['label']}，{stage_of(days_left)}，还剩 {days_left} 天，"
-        f"整体掌握度约 {mastery:.0%}。{pressure['source']}。"
-    )
+    **关键约定**：这里只负责「把事实和素材分开」，不负责写答案。
+    以前把 ``mastery`` 直接写进 ``reading``，而它常常是「没有记录时的默认 0.5」，
+    于是模型照着讲出「你掌握度五成」——一句话就编出了用户的学习水平。
+    现在：没记录就说没记录（进 ``unknowns``），估出来的天数标「估算」。
+    """
+    pressure = EXAM_PRESSURE.get(exam_type, EXAM_PRESSURE["gaokao"])
+    raw = (text or "").strip()
+    detected = mood or detect_mood(raw)
+    if not detected or detected not in MOOD_STRATEGIES:
+        # 认不出来时的兜底：他打了字就问，一个字都没说才允许按天数猜
+        detected = "unclear" if raw else _default_mood(days_left, mastery)
+    strategy = MOOD_STRATEGIES[detected]
+    risk = detect_risk(raw)
+    insufficient = detected == "unclear"
+
+    # ── 已知事实：逐条带来源，模型只能照着说 ──
+    facts: list[tuple[str, str]] = [("档案", f"目标考试：{pressure['label']}")]
+    if exam_date:
+        facts.append(("档案", f"考试日期：{exam_date}"))
+    if days_estimated:
+        facts.append(("估算", f"距今约 {days_left} 天（**考试日期未填写，按常规考期估算，不是确数**）"))
+    else:
+        facts.append(("档案", f"距今 {days_left} 天（{stage_of(days_left)}）"))
+    if mastery_known and attempts > 0:
+        facts.append(("作答记录", f"已跟踪 {attempts} 次作答，平均掌握度约 {mastery:.0%}"))
+    if raw:
+        facts.append(("他刚才的原话", raw[:200]))
+
+    # ── 不知道的事：明令禁止推测成数字 ──
+    unknowns: list[str] = []
+    if not (mastery_known and attempts > 0):
+        unknowns.append(
+            "他的真实水平（**没有任何作答记录，系统里的 0.5 只是默认值，不是他的水平**）"
+        )
+    if days_estimated:
+        unknowns.append("确切的考试日期（未填写，上面那个天数是估算）")
+    unknowns.append("他的作息、每天能学多久、以前考过几次、家里和同学说过什么——这些你都不知道")
+
+    reading = f"{pressure['label']}｜{stage_of(days_left)}｜还剩 {days_left} 天"
+    reading += f"｜平均掌握度 {mastery:.0%}（{attempts} 次作答）" if (mastery_known and attempts > 0) \
+        else "｜掌握度：暂无作答记录"
+
     return CounselResult(
         exam_type=exam_type,
         exam_label=pressure["label"],
@@ -313,42 +398,109 @@ def counsel(
         mood=detected,
         mood_label=strategy["label"],
         reading=reading,
-        reframe=strategy["reframe"] + "\n" + pressure["core"],
+        reframe=strategy["reframe"],
         actions=list(strategy["actions"]),
         hint=HINTS.get(exam_type, ""),
         risk=risk,
         risk_text=RISK_ADVICE if risk else "",
+        user_text=raw,
+        facts=facts,
+        unknowns=unknowns,
+        pattern=f"{pressure['source']}｜应对方向：{pressure['core']}",
+        insufficient=insufficient,
     )
 
 
-def build_comfort_prompt(result: CounselResult, catgirl_name: str, level: str = "normal") -> tuple[str, str]:
+def build_comfort_prompt(
+    result: CounselResult,
+    catgirl_name: str,
+    level: str = "normal",
+    persona: str = "full",
+) -> tuple[str, str]:
+    """疏导提示词。
+
+    注意这里**不再给模型一份写好的答案**。以前把 reading + reframe + 三条动作
+    按顺序喂过去，模型只会换个说法复述一遍——用户说什么都得到同一套。
+    现在只给「事实」和「可选素材」，并明确要求先回应他这句话本身。
+    """
+    # 信息不足时，正常的"给 2-3 条动作"就是错的——先问清楚
+    tone = LEVEL_TONE.get(level, LEVEL_TONE["normal"])
+    if result.insufficient:
+        tone = "只用一两句接住他，然后问一个具体问题；不要给方案清单，也不要总结他的处境。"
+    elif result.mood == "angry":
+        tone = "别劝他『别生气』，也别上呼吸法；先认这股火有道理，再给一个能立刻做的小动作。"
     system = (
-        f"你是陪伴备考的猫娘{catgirl_name}。现在要做的是心理疏导，语气要求：{LEVEL_TONE.get(level, LEVEL_TONE['normal'])}\n"
+        f"你是陪伴备考的猫娘{catgirl_name}。现在要做的是心理疏导。\n"
+        f"语气要求：{tone}\n"
+        f"{persona_directive(persona)}\n"
+        f"{guard.FACT_RULES}\n"
         "硬性要求：\n"
+        "  · 第一句必须回应他刚刚说的那句话，不能跳过它直接开始分析；\n"
         "  · 不编造励志故事，不喊口号，不说『你一定可以的』这种空话；\n"
-        "  · 所有建议必须是今天就能做的具体动作；\n"
-        "  · 先接住情绪（承认这个处境确实难），再给方法，顺序不能反；\n"
+        "  · 建议必须落到今天/现在能做的具体动作，且**针对他这次说的这件事**；\n"
         "  · 不做医疗诊断、不开药、不替代专业心理治疗；\n"
-        "  · 如果用户表达出自我伤害的意思，不要试图自己处理，直接劝其联系专业热线与身边信任的人。\n"
-        "用你自己的口吻说，不要复述条目。"
+        "  · 如果用户表达出自我伤害的意思，不要试图自己处理，直接劝其联系专业热线与身边信任的人；\n"
+        "  · 你不是心理咨询师，允许说『这个我不好替你判断』。\n"
+        f"{guard.layout_rule()}\n"
+        "不要复述素材，也不要写成通用总结陈词——那看起来像模板，用户一眼能看出来。"
     )
-    user = (
-        f"{result.reading}\n"
-        f"情绪状态：{result.mood_label}\n"
-        f"认知重构要点：{result.reframe}\n"
-        f"可给的具体动作：\n" + "\n".join(f"  - {item}" for item in result.actions) + "\n"
-        f"可用的心理暗示句：{result.hint}\n"
-    )
+    blocks = [guard.reply_first(result.user_text)]
+    if result.insufficient:
+        blocks.append(
+            "## 本次的正确做法\n"
+            "他给的信息太少，无法判断处境。**不要给三条动作、不要给暗示句**：\n"
+            "接一句（可以短到一行），然后问一个**具体**的问题——"
+            "比如「是刚做完卷子受打击了，还是压根不想打开书？」；\n"
+            "如果骂人是在泄愤，就允许他骂，别教育他别骂人。"
+        )
+    blocks.append(guard.facts_block(result.facts))
+    unknowns = guard.unknowns_block(result.unknowns)
+    if unknowns:
+        blocks.append(unknowns)
+    if result.pattern:
+        blocks.append(
+            "## 参考：这类考试的常见压力模式（**通用规律，不是说他就是这样**）\n"
+            f"{result.pattern}\n"
+            "只用来理解他，不许写成他的经历。"
+        )
+    option = guard.options_block("可用的重构角度", [result.reframe] if result.reframe else [])
+    if option:
+        blocks.append(option)
+    option = guard.options_block("可用的动作素材", result.actions)
+    if option:
+        blocks.append(option)
+    # 烦躁 / 信息不足时不下发暗示句：那种场景里念一句「卡在词汇和时间分配上」只会更烦
+    if result.hint and result.mood not in ("angry", "unclear"):
+        blocks.append(
+            f"## 暗示句（可选，最多用一句；不贴合就别用）\n- {result.hint}"
+        )
     if result.risk:
-        user += f"\n⚠ 检测到风险信号，必须立刻转为求助建议：\n{result.risk_text}\n"
-    return system, user
+        blocks.append(f"## ⚠ 检测到风险信号，必须立刻转为求助建议\n{result.risk_text}")
+    return system, "\n\n".join(blocks)
 
 
 def format_counsel(result: CounselResult) -> str:
-    lines = [result.reading, f"\n状态判断：{result.mood_label}", f"\n{result.reframe}", "\n可以现在就做："]
-    lines.extend(f"  · {item}" for item in result.actions)
-    if result.hint:
-        lines.append(f"\n记住这一句：{result.hint}")
+    """没有模型可用时的兜底（风险场景也直接走这里）。
+
+    兜底同样不许编：没有作答记录就写「暂无记录」，天数按常规考期估的就标「估算」。
+    """
     if result.risk:
-        lines.append(f"\n{result.risk_text}")
-    return "\n".join(lines)
+        return fmt.join(
+            fmt.note(result.reading),
+            fmt.section("需要认真对待", result.risk_text),
+        )
+    facts = fmt.bullets([f"**{source}**｜{text}" for source, text in result.facts])
+    blocks: list[str] = [fmt.section("已知情况", facts)] if facts else []
+    if result.insufficient:
+        blocks.append(
+            "你这句太短，我不确定到底发生了什么——是刚做完卷子受了打击，还是压根不想打开书？"
+            "先说一句，我按你说的来。"
+        )
+        return fmt.join(*blocks)
+    if result.reframe:
+        blocks.append(result.reframe)
+    if result.actions:
+        blocks.append(fmt.section("可以现在就做", fmt.bullets(result.actions)))
+    if result.hint:
+        blocks.append(fmt.section("记住这一句", fmt.note(result.hint)))
+    return fmt.join(*blocks)

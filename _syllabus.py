@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from . import _fmt as fmt
 from ._profiles import (
     FORM_CALC,
     FORM_CASE,
@@ -907,19 +908,20 @@ def _roi_reason(point: KnowledgePoint, mastery: float) -> str:
 
 
 def format_point(point: KnowledgePoint) -> str:
-    lines = [
-        f"【{point.name}】难度 {point.difficulty:g}/5 · 考频 {point.frequency} · 分值权重 {point.weight:g}",
-        f"只会出现在：{'、'.join(form_label(item) for item in point.forms)}",
-    ]
-    if point.big:
-        lines.append("注意：这是压轴大题的常见载体。")
+    """知识点画像：给学习者看的版本（与 ``format_profile`` 不同，后者是给模型看的）。"""
+    head = fmt.bold(point.name)
+    head += f"　难度 {point.difficulty:g}/5　考频 {point.frequency}　权重 {point.weight:g}"
+    rows = [fmt.kv("命题形式", "、".join(form_label(item) for item in point.forms))]
     if point.prerequisites:
-        lines.append("前置知识：" + "、".join(point.prerequisites))
-    if point.traps:
-        lines.append("典型易错点：\n  - " + "\n  - ".join(point.traps))
+        rows.append(fmt.kv("前置知识", "、".join(point.prerequisites)))
     if point.note:
-        lines.append(f"命题备注：{point.note}")
-    return "\n".join(lines)
+        rows.append(fmt.kv("命题备注", point.note))
+    blocks = [head, "\n".join(rows)]
+    if point.big:
+        blocks.append(fmt.note("这是压轴大题的常见载体。"))
+    if point.traps:
+        blocks.append(fmt.section("典型易错点", fmt.bullets(point.traps)))
+    return fmt.join(*blocks)
 
 
 def format_points(points: list[KnowledgePoint], limit: int = 12) -> str:

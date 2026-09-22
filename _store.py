@@ -17,7 +17,7 @@ import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS profile (
@@ -82,6 +82,69 @@ CREATE TABLE IF NOT EXISTS sessions (
     summary TEXT DEFAULT '',
     created REAL DEFAULT 0
 );
+
+-- ── 短期记忆：对话回合与材料（讲解、诊断、提问的原话），到期自动清理 ──
+CREATE TABLE IF NOT EXISTS memory_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT DEFAULT '',       -- 话题/会话标识，同一件事的上下文串在一起
+    role TEXT DEFAULT 'user',      -- user / assistant / material（如截图转写）
+    text TEXT DEFAULT '',
+    topic TEXT DEFAULT '',         -- 知识点名或科目，检索用
+    ref_kind TEXT DEFAULT '',      -- vision / diagnose / quiz / teach / comfort …
+    ref_id TEXT DEFAULT '',
+    created REAL DEFAULT 0,
+    expires REAL DEFAULT 0         -- 到点就该删；长期结论另行压进 memory_facts
+);
+CREATE INDEX IF NOT EXISTS idx_turns_created ON memory_turns(created);
+CREATE INDEX IF NOT EXISTS idx_turns_session ON memory_turns(session);
+CREATE INDEX IF NOT EXISTS idx_turns_topic ON memory_turns(topic);
+
+-- ── 修行经验：只记真实学习行为产生的经验（答题、诊断、讲解、复习）──
+CREATE TABLE IF NOT EXISTS exp_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT DEFAULT '',        -- attempt_correct / attempt_wrong / diagnose / teach / quiz / review …
+    amount INTEGER DEFAULT 0,
+    note TEXT DEFAULT '',
+    created REAL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_exp_created ON exp_log(created);
+
+-- ── 小游戏成绩：每局一条，用于最高分、连击、累计等记录 ──────────
+CREATE TABLE IF NOT EXISTS game_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game TEXT DEFAULT '',        -- fruit / piano …
+    score INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1,
+    max_combo INTEGER DEFAULT 0,
+    duration REAL DEFAULT 0,
+    sliced INTEGER DEFAULT 0,
+    missed INTEGER DEFAULT 0,
+    created REAL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_game_runs ON game_runs(game, score DESC);
+
+-- ── 徽章：按 key 只发一次，条件都来自真实数据 ──────────────────
+CREATE TABLE IF NOT EXISTS badges (
+    key TEXT PRIMARY KEY,
+    title TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    created REAL DEFAULT 0
+);
+
+-- ── 长期记忆：压缩后的事实（进度、薄弱点、偏好、反复错的原因），不自动删 ──
+CREATE TABLE IF NOT EXISTS memory_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT DEFAULT 'note',      -- progress / weakness / mistake / preference / diagnosis / note
+    key TEXT DEFAULT '',           -- 同一 (kind, key) 覆盖更新，避免堆重复
+    text TEXT DEFAULT '',
+    topic TEXT DEFAULT '',
+    importance INTEGER DEFAULT 3,  -- 1~5，越大越优先被召回
+    hits INTEGER DEFAULT 0,        -- 被召回次数，用于排序
+    created REAL DEFAULT 0,
+    updated REAL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_key ON memory_facts(kind, key);
+CREATE INDEX IF NOT EXISTS idx_facts_importance ON memory_facts(importance DESC, updated DESC);
 """
 
 _PROFILE_COLUMNS = (
@@ -335,4 +398,321 @@ class StudyStore:
             "plan": bool(self.latest_plan()),
             "diagnosis": bool(self.latest_diagnosis()),
             "resources": len(self.list_resources(limit=100)),
+        }
+
+    # ── 修行经验与徽章 ────────────────────────────────────────
+    def add_exp(self, kind: str, amount: int, note: str = "") -> int:
+        """记一笔经验。``amount`` 由调用方按规则算好（见 ``_progress``）。"""
+        value = int(amount)
+        if value == 0:
+            return 0
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO exp_log (kind, amount, note, created) VALUES (?, ?, ?, ?)",
+                    (kind or "", value, (note or "")[:200], time.time()),
+                )
+        return value
+
+    def exp_total(self) -> int:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COALESCE(SUM(amount), 0) AS n FROM exp_log").fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    def exp_recent(self, limit: int = 12) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            return self._read(conn, "SELECT * FROM exp_log ORDER BY id DESC LIMIT ?", (int(limit),))
+
+    def exp_between(self, start: float, end: float) -> int:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS n FROM exp_log WHERE created >= ? AND created <= ?",
+                (float(start), float(end)),
+            ).fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    def exp_timestamps(self, limit: int = 2000) -> list[float]:
+        """有记录的时间点，用来算连续天数与早起徽章。"""
+        with closing(self._connect()) as conn:
+            rows = self._read(conn, "SELECT created FROM exp_log ORDER BY created DESC LIMIT ?", (int(limit),))
+        return [float(row["created"] or 0) for row in rows]
+
+    def list_badges(self) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            return self._read(conn, "SELECT * FROM badges ORDER BY created ASC")
+
+    def has_badge(self, key: str) -> bool:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT 1 FROM badges WHERE key = ?", (key or "",)).fetchone()
+        return row is not None
+
+    def award_badge(self, key: str, title: str, note: str = "") -> bool:
+        """发徽章；已经有了就返回 False（天然幂等）。"""
+        if not key or self.has_badge(key):
+            return False
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO badges (key, title, note, created) VALUES (?, ?, ?, ?)",
+                    (key, title, (note or "")[:200], time.time()),
+                )
+        return True
+
+    def count_kind(self, table: str, kind: str = "") -> int:
+        """按 kind 统计次数（sessions / exp_log 用）。"""
+        if table not in ("sessions", "exp_log"):
+            return 0
+        with closing(self._connect()) as conn:
+            if kind:
+                row = conn.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE kind = ?", (kind,)).fetchone()
+            else:
+                row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    # ── 小游戏记录 ────────────────────────────────────────────
+    def save_game_run(
+        self,
+        game: str,
+        score: int,
+        *,
+        level: int = 1,
+        max_combo: int = 0,
+        duration: float = 0.0,
+        sliced: int = 0,
+        missed: int = 0,
+    ) -> int:
+        with closing(self._connect()) as conn:
+            with conn:
+                cursor = conn.execute(
+                    "INSERT INTO game_runs (game, score, level, max_combo, duration, sliced, missed, created) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        game or "fruit",
+                        int(score),
+                        int(level),
+                        int(max_combo),
+                        float(duration),
+                        int(sliced),
+                        int(missed),
+                        time.time(),
+                    ),
+                )
+                return int(cursor.lastrowid or 0)
+
+    def game_best(self, game: str = "fruit") -> dict[str, Any]:
+        """历史最好成绩（没有记录时返回空 dict）。"""
+        with closing(self._connect()) as conn:
+            rows = self._read(
+                conn,
+                "SELECT * FROM game_runs WHERE game = ? ORDER BY score DESC, id ASC LIMIT 1",
+                (game or "fruit",),
+            )
+        return rows[0] if rows else {}
+
+    def game_totals(self, game: str = "fruit") -> dict[str, Any]:
+        """累计记录：局数、总分、切中/漏掉总数、最长存活、最高连击、最高等级。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS runs, COALESCE(SUM(score), 0) AS score, "
+                "COALESCE(SUM(sliced), 0) AS sliced, COALESCE(SUM(missed), 0) AS missed, "
+                "COALESCE(MAX(max_combo), 0) AS combo, COALESCE(MAX(duration), 0) AS best_time, "
+                "COALESCE(MAX(level), 0) AS level FROM game_runs WHERE game = ?",
+                (game or "fruit",),
+            ).fetchone()
+        if not row:
+            return {"runs": 0, "score": 0, "sliced": 0, "missed": 0, "combo": 0, "best_time": 0, "level": 0}
+        return {
+            "runs": int(row["runs"] or 0),
+            "score": int(row["score"] or 0),
+            "sliced": int(row["sliced"] or 0),
+            "missed": int(row["missed"] or 0),
+            "combo": int(row["combo"] or 0),
+            "best_time": float(row["best_time"] or 0),
+            "level": int(row["level"] or 0),
+        }
+
+    def game_recent(self, game: str = "fruit", limit: int = 8) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            return self._read(
+                conn,
+                "SELECT * FROM game_runs WHERE game = ? ORDER BY id DESC LIMIT ?",
+                (game or "fruit", int(limit)),
+            )
+
+    # ── 短期记忆（对话回合）────────────────────────────────────
+    def add_turn(
+        self,
+        role: str,
+        text: str,
+        *,
+        session: str = "",
+        topic: str = "",
+        ref_kind: str = "",
+        ref_id: str = "",
+        ttl_days: float = 7.0,
+    ) -> int:
+        """记一条短期记忆。``expires`` 到点后由 :meth:`purge_turns` 清掉。"""
+        body = (text or "").strip()
+        if not body:
+            return 0
+        now = time.time()
+        with closing(self._connect()) as conn:
+            with conn:
+                cursor = conn.execute(
+                    "INSERT INTO memory_turns (session, role, text, topic, ref_kind, ref_id, created, expires) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session or "",
+                        role or "user",
+                        body[:4000],
+                        topic or "",
+                        ref_kind or "",
+                        ref_id or "",
+                        now,
+                        now + max(0.0, float(ttl_days)) * 86400,
+                    ),
+                )
+                return int(cursor.lastrowid or 0)
+
+    def recent_turns(
+        self,
+        limit: int = 8,
+        *,
+        session: str = "",
+        topic: str = "",
+        now: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
+        """取最近的短期记忆（默认只取未过期的）。"""
+        stamp = time.time() if now is None else float(now)
+        sql = "SELECT * FROM memory_turns WHERE expires > ?"
+        params: list[Any] = [stamp]
+        if session:
+            sql += " AND session = ?"
+            params.append(session)
+        if topic:
+            sql += " AND topic = ?"
+            params.append(topic)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        with closing(self._connect()) as conn:
+            rows = self._read(conn, sql, tuple(params))
+        return list(reversed(rows))
+
+    def expired_turns(self, now: Optional[float] = None, limit: int = 300) -> list[dict[str, Any]]:
+        """取已过期、等着被清理的短期记忆（清理前压缩成长期事实要用）。"""
+        stamp = time.time() if now is None else float(now)
+        with closing(self._connect()) as conn:
+            rows = self._read(
+                conn,
+                "SELECT * FROM memory_turns WHERE expires <= ? ORDER BY id DESC LIMIT ?",
+                (stamp, int(limit)),
+            )
+        return list(reversed(rows))
+
+    def purge_turns(self, keep_days: float = 7.0, now: Optional[float] = None) -> int:
+        """清理过期短期记忆，返回删除条数。
+
+        调用方通常会在清理前把值得长期留的信息压进 ``memory_facts``——
+        删的是原话，留下的是结论。
+        """
+        stamp = time.time() if now is None else float(now)
+        cutoff = stamp - max(0.0, float(keep_days)) * 86400
+        with closing(self._connect()) as conn:
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM memory_turns WHERE expires <= ? OR created <= ?", (stamp, cutoff)
+                )
+                return int(cursor.rowcount or 0)
+
+    def clear_turns(self, session: str = "") -> int:
+        with closing(self._connect()) as conn:
+            with conn:
+                if session:
+                    cursor = conn.execute("DELETE FROM memory_turns WHERE session = ?", (session,))
+                else:
+                    cursor = conn.execute("DELETE FROM memory_turns")
+                return int(cursor.rowcount or 0)
+
+    def count_turns(self, now: Optional[float] = None) -> int:
+        stamp = time.time() if now is None else float(now)
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM memory_turns WHERE expires > ?", (stamp,)).fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    # ── 长期记忆（压缩后的事实）────────────────────────────────
+    def upsert_fact(
+        self,
+        kind: str,
+        key: str,
+        text: str,
+        *,
+        topic: str = "",
+        importance: int = 3,
+    ) -> int:
+        """写一条长期事实；同 (kind, key) 覆盖更新，不会堆重复。"""
+        body = (text or "").strip()
+        if not body:
+            return 0
+        now = time.time()
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO memory_facts (kind, key, text, topic, importance, hits, created, updated) "
+                    "VALUES (?, ?, ?, ?, ?, 0, ?, ?) "
+                    "ON CONFLICT(kind, key) DO UPDATE SET text = excluded.text, topic = excluded.topic, "
+                    "importance = MAX(importance, excluded.importance), updated = excluded.updated",
+                    (kind or "note", key or body[:48], body[:2000], topic or "", int(importance), now, now),
+                )
+        return 1
+
+    def list_facts(self, *, kind: str = "", topic: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM memory_facts WHERE 1 = 1"
+        params: list[Any] = []
+        if kind:
+            sql += " AND kind = ?"
+            params.append(kind)
+        if topic:
+            sql += " AND topic = ?"
+            params.append(topic)
+        sql += " ORDER BY importance DESC, updated DESC LIMIT ?"
+        params.append(int(limit))
+        with closing(self._connect()) as conn:
+            return self._read(conn, sql, tuple(params))
+
+    def search_facts(self, keyword: str, limit: int = 6) -> list[dict[str, Any]]:
+        """按关键词在长期记忆里找：先按 topic/key 命中，再按正文命中。"""
+        text = (keyword or "").strip()
+        if not text:
+            return []
+        like = f"%{text}%"
+        with closing(self._connect()) as conn:
+            rows = self._read(
+                conn,
+                "SELECT * FROM memory_facts WHERE topic LIKE ? OR key LIKE ? OR text LIKE ? "
+                "ORDER BY importance DESC, updated DESC LIMIT ?",
+                (like, like, like, int(limit)),
+            )
+            for row in rows:
+                conn.execute("UPDATE memory_facts SET hits = hits + 1 WHERE id = ?", (row["id"],))
+            conn.commit()
+        return rows
+
+    def drop_fact(self, fact_id: int) -> int:
+        with closing(self._connect()) as conn:
+            with conn:
+                cursor = conn.execute("DELETE FROM memory_facts WHERE id = ?", (int(fact_id),))
+                return int(cursor.rowcount or 0)
+
+    def memory_stats(self, now: Optional[float] = None) -> dict[str, Any]:
+        stamp = time.time() if now is None else float(now)
+        with closing(self._connect()) as conn:
+            turns = conn.execute("SELECT COUNT(*) AS n FROM memory_turns WHERE expires > ?", (stamp,)).fetchone()
+            expired = conn.execute("SELECT COUNT(*) AS n FROM memory_turns WHERE expires <= ?", (stamp,)).fetchone()
+            facts = conn.execute("SELECT COUNT(*) AS n FROM memory_facts").fetchone()
+            oldest = conn.execute("SELECT MIN(created) AS t FROM memory_turns WHERE expires > ?", (stamp,)).fetchone()
+        return {
+            "turns": int(turns["n"] or 0) if turns else 0,
+            "expired": int(expired["n"] or 0) if expired else 0,
+            "facts": int(facts["n"] or 0) if facts else 0,
+            "oldest_turn": float(oldest["t"] or 0) if oldest else 0.0,
         }

@@ -14,6 +14,7 @@ import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import _fmt as fmt
 from ._profiles import get_profile, parse_credits, region_note
 from ._syllabus import all_points, roi_ranking
 
@@ -53,6 +54,10 @@ class StudyPlan:
     daily: list[dict[str, Any]] = field(default_factory=list)
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # 有作答记录的知识点数：0 表示这份计划的时间分配只是按默认值估的，
+    # 输出时要如实说明，不能宣称"按提分性价比排的"。
+    tracked_points: int = 0
+    date_estimated: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -69,6 +74,8 @@ class StudyPlan:
             "daily": self.daily,
             "checkpoints": self.checkpoints,
             "notes": self.notes,
+            "tracked_points": self.tracked_points,
+            "date_estimated": self.date_estimated,
         }
 
 
@@ -233,6 +240,21 @@ def build_plan(
     checkpoints = _build_checkpoints(phases, exam_date)
     notes = _build_notes(profile, days_left, target_score, exam_profile.total_score)
 
+    # 有作答记录的知识点数：0 就意味着时间分配没有真实依据，得如实说明
+    tracked_points = sum(_weighted_mastery(exam_type, subject, mastery)[1] for subject in subjects)
+    if tracked_points == 0:
+        notes.insert(
+            0,
+            "还没有任何作答记录：下面的时间分配是按默认掌握度估的（基本等于各科平均分），"
+            "只能当起步框架。做过一轮题之后重新生成，才会真正按你的薄弱点排序。",
+        )
+    date_estimated = not str(profile.get("exam_date") or "").strip()
+    if date_estimated:
+        notes.insert(
+            0,
+            f"考试日期没填，天数按常规考期估算为 {days_left} 天；填上确切日期后阶段划分会重算。",
+        )
+
     return StudyPlan(
         exam_type=exam_type,
         exam_name=exam_profile.name,
@@ -247,6 +269,8 @@ def build_plan(
         daily=daily,
         checkpoints=checkpoints,
         notes=notes,
+        tracked_points=tracked_points,
+        date_estimated=date_estimated,
     )
 
 
@@ -417,33 +441,46 @@ def subject_label(key: str) -> str:
 
 
 def format_plan(plan: StudyPlan) -> str:
-    lines = [
-        f"【{plan.exam_name}】目标 {plan.target_score:g} 分｜考试日 {plan.exam_date}｜还剩 {plan.days_left} 天",
-        f"科目：{'、'.join(subject_label(item) for item in plan.subjects)}",
+    date_note = "（估算）" if plan.date_estimated else ""
+    head = [
+        fmt.kv("考试", plan.exam_name),
+        fmt.kv("目标", f"{plan.target_score:g} 分" if plan.target_score else "未设定"),
+        fmt.kv("考试日", f"{plan.exam_date}{date_note}（还剩 {plan.days_left} 天）"),
+        fmt.kv("科目", "、".join(subject_label(item) for item in plan.subjects)),
     ]
+    blocks = [fmt.section("总体", fmt.bullets(head))]
+
     if plan.allocation:
-        detail = "、".join(
-            f"{subject_label(subject)} {minutes} 分钟" for subject, minutes in plan.allocation.items()
-        )
-        lines.append(f"每日时间分配（按提分性价比）：{detail}")
-    lines.append("\n阶段安排：")
-    for phase in plan.phases:
-        lines.append(
-            f"  · {phase['name']}期 第 {phase['start_day']}-{phase['end_day']} 天：{phase['focus']}"
-        )
+        total = sum(plan.allocation.values()) or 1
+        rows = []
+        for subject, minutes in plan.allocation.items():
+            share = minutes / total
+            rows.append(f"{subject_label(subject)}　{fmt.bar(share)} {minutes} 分钟")
+        title = "每日时间分配（按提分性价比）" if plan.tracked_points else "每日时间分配（**暂无作答记录，等权起步**）"
+        blocks.append(fmt.section(title, fmt.bullets(rows)))
+
+    if plan.phases:
+        rows = [
+            f"**{phase['name']}期**　第 {phase['start_day']}-{phase['end_day']} 天　{phase['focus']}"
+            for phase in plan.phases
+        ]
+        blocks.append(fmt.section("阶段安排", fmt.bullets(rows)))
+
     if plan.weekly:
-        lines.append("\n周计划：")
+        rows = []
         for week in plan.weekly[:8]:
             focus = "、".join(week["focus"])
-            lines.append(f"  第 {week['week']} 周（{week['phase']}期）：{focus}")
-    lines.append("\n每日模板：")
-    for block in plan.daily:
-        lines.append(f"  · {block['slot']} {block['minutes']} 分钟：{block['task']}")
+            rows.append(f"第 {week['week']} 周（{week['phase']}期）：{focus}")
+        blocks.append(fmt.section("周计划", fmt.numbered(rows)))
+
+    if plan.daily:
+        rows = [f"{block['slot']}　{block['minutes']} 分钟　{block['task']}" for block in plan.daily]
+        blocks.append(fmt.section("每日模板", fmt.bullets(rows)))
+
     if plan.checkpoints:
-        lines.append("\n检查点：")
-        for row in plan.checkpoints:
-            lines.append(f"  · 第 {row['day']} 天（{row['phase']}期结束）：{row['action']}")
+        rows = [f"第 {row['day']} 天（{row['phase']}期结束）：{row['action']}" for row in plan.checkpoints]
+        blocks.append(fmt.section("检查点", fmt.bullets(rows)))
+
     if plan.notes:
-        lines.append("\n提醒：")
-        lines.extend(f"  · {note}" for note in plan.notes)
-    return "\n".join(lines)
+        blocks.append(fmt.section("提醒", "\n".join(fmt.note(item) for item in plan.notes)))
+    return fmt.join(*blocks)

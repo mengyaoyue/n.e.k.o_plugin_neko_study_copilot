@@ -11,7 +11,7 @@ import hashlib
 import re
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 try:  # 宿主冻结环境可能没打包 concurrent.futures，缺了就退化成串行检索
@@ -19,6 +19,7 @@ try:  # 宿主冻结环境可能没打包 concurrent.futures，缺了就退化�
 except Exception:  # pragma: no cover - 冻结宿主路径
     _ThreadPoolExecutor = None
 
+from . import _fmt as fmt
 from ._crawl import Crawler, html_to_text
 
 _WBI_TAB = (
@@ -130,6 +131,13 @@ class ResourceItem:
     kind: str = "course"
     summary: str = ""
     blocked_by_robots: bool = False
+    # ── 内容分析（抓正文后由大模型填，见 N.E.K.O 插件侧 _analyze_resources）──
+    covers: str = ""   # 这份材料到底讲了什么
+    fit: str = ""      # 与用户当前需求哪里对得上
+    level: str = ""    # 适合什么阶段
+    how: str = ""      # 建议怎么用
+    # 抓下来的正文摘录，只用于喂模型，不落库也不返给前端
+    excerpt: str = field(default="", repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -140,6 +148,10 @@ class ResourceItem:
             "kind": self.kind,
             "summary": self.summary,
             "blocked_by_robots": self.blocked_by_robots,
+            "covers": self.covers,
+            "fit": self.fit,
+            "level": self.level,
+            "how": self.how,
         }
 
 
@@ -367,6 +379,54 @@ class ResourceSearcher:
             return {"ok": False, "url": url, "text": "", "error": result.error or f"HTTP {result.status}"}
         return {"ok": True, "url": url, "text": html_to_text(result.text, limit=limit), "error": ""}
 
+    def search_with_excerpt(
+        self,
+        query: str,
+        source_ids: Optional[list[str]] = None,
+        limit: int = 4,
+        excerpt_chars: int = 1500,
+    ) -> list[ResourceItem]:
+        """检索 + 把候选页正文抓下来（放进 ``excerpt`` 供大模型做内容分析）。
+
+        只做"取回"，不做判断——判断那一层交给模型，因为它需要理解用户的需求。
+        抓不到正文的条目照样返回，只是没有 excerpt，前端会退化成链接展示。
+        """
+        items = self.search(query, source_ids, limit)
+        if not items:
+            return []
+        picked = items[: max(1, limit)]
+        results: dict[int, str] = {}
+
+        def grab(index: int, url: str) -> None:
+            try:
+                detail = self.fetch_detail(url, limit=excerpt_chars)
+            except Exception:
+                return
+            if not detail.get("ok"):
+                return
+            text = detail.get("text")
+            if isinstance(text, str) and text.strip():
+                results[index] = text.strip()
+
+        if _ThreadPoolExecutor is not None and len(picked) > 1:
+            with _ThreadPoolExecutor(max_workers=min(3, len(picked))) as pool:
+                futures = [pool.submit(grab, index, item.url) for index, item in enumerate(picked)]
+                for future in futures:
+                    try:
+                        future.result(timeout=self.crawler.timeout * 3)
+                    except Exception:
+                        continue
+        else:
+            for index, item in enumerate(picked):
+                grab(index, item.url)
+        for index, item in enumerate(picked):
+            text = results.get(index, "")
+            if text:
+                item.excerpt = text
+            elif not item.summary:
+                item.summary = f"（未能自动抓取正文，可在 {item.source_name} 手动打开）"
+        return picked
+
 
 def list_sources() -> list[dict[str, Any]]:
     return [
@@ -388,12 +448,70 @@ def build_query(topic: str, subject: str = "", exam_type: str = "") -> str:
     return " ".join(parts).strip()
 
 
-def format_resources(items: list[ResourceItem], limit: int = 8) -> str:
-    if not items:
-        return "没有检索到公开资源喵。"
+def build_links(keyword: str, source_ids: Optional[list[str]] = None) -> list[tuple[str, str, str]]:
+    """按关键词生成各免费平台的**搜索直链**（不需要抓取，必定可用）。
+
+    这是「模型可以自己联网」时最好的搭档：插件负责给出准确的落点，
+    模型负责去读、去总结，用户也能直接点进去。
+    """
+    text = (keyword or "").strip()
+    if not text:
+        return []
+    wanted = list(source_ids) if source_ids else list(DEFAULT_SOURCE_IDS)
+    quoted = urllib.parse.quote(text)
+    rows: list[tuple[str, str, str]] = []
+    for sid in wanted:
+        spec = SOURCE_BY_ID.get(sid)
+        if spec is None:
+            continue
+        rows.append((spec.name, spec.search_template.format(q=quoted), spec.note))
+    return rows
+
+
+def format_resource_plan(keyword: str, source_ids: Optional[list[str]] = None) -> str:
+    """把「去哪找」整理成清单：平台 + 直链 + 这个平台适合找什么。"""
+    text = (keyword or "").strip()
+    if not text:
+        return "想找哪个知识点/题型的资料？给我个关键词。"
+    rows = build_links(text, source_ids)
+    if not rows:
+        return "没有可用的资源平台配置。"
     lines = []
+    for name, url, note in rows:
+        line = f"{fmt.bold(name)}\n　　{url}"
+        if note:
+            line += f"\n　　{fmt.kv('适合', note)}"
+        lines.append(line)
+    return fmt.join(
+        fmt.section(f"「{text}」的免费资源检索清单", "\n\n".join(lines)),
+        fmt.note("链接都已经带上关键词，点开就是结果页；中文平台优先，B 站视频量最大但质量参差。"),
+    )
+
+
+def format_resources(items: list[ResourceItem], limit: int = 8) -> str:
+    """资源输出：每条都给出「讲了什么 / 与你需求的关系 / 适合阶段 / 怎么用」。
+
+    没做过内容分析（例如抓取失败）时，自动退化成「平台 + 标题 + 链接」，
+    不会出现空白条目。
+    """
+    if not items:
+        return "这次没检索到合适的公开资源。可以换个更具体的说法，或直接用『资源清单』让我给你各平台搜索直链。"
+    blocks: list[str] = []
     for index, item in enumerate(items[:limit], start=1):
-        flag = "（需手动打开）" if item.blocked_by_robots else ""
-        summary = f" —— {item.summary}" if item.summary else ""
-        lines.append(f"{index}. [{item.source_name}] {item.title}{flag}\n   {item.url}{summary}")
-    return "\n".join(lines)
+        flag = "（该站不允许自动抓取，需手动打开）" if item.blocked_by_robots else ""
+        head = f"{fmt.bold(f'{index}. {item.title}')}　{fmt.bold('来源')}：{item.source_name}{flag}"
+        rows: list[str] = []
+        if item.covers:
+            rows.append(fmt.kv("讲了什么", item.covers))
+        if item.fit:
+            rows.append(fmt.kv("和你的需求", item.fit))
+        if item.level:
+            rows.append(fmt.kv("适合阶段", item.level))
+        if item.how:
+            rows.append(fmt.kv("建议用法", item.how))
+        if not rows:
+            if item.summary:
+                rows.append(fmt.kv("简介", item.summary))
+            rows.append(fmt.kv("链接", item.url))
+        blocks.append(head + "\n" + "\n".join(f"　{r}" for r in rows))
+    return fmt.join(*blocks)
